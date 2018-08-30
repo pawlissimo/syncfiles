@@ -1,0 +1,71 @@
+Hey Pavlo,
+
+Nice to E-Meet you.
+Let's dive right into the task with details.
+
+Introduction
+There is an s3cmd command (look it up) of Amazon AWS. We have it in our server and it is configured and working properly. What this command does is syncing files and folders to our s3 bucket at the AWS account.
+
+The when running the command on a folder, it will go over the entire folder trying to create some internal database of its own (Let's call it "indexing"), then will start running the sync per each of the files.
+
+When running the command on a large folder like we have (This task is needed only for that folder), the indexing process takes too long and will either stuck or it will not work properly for our uses (For many reasons, no need to explain them here).
+
+Our images folder can contain more than 1M (1000000) of files.
+
+The Solution
+The script we have runs the same s3cmd command with the same parameters (relative paths, and other parameters) on each of the files as if it was running manually per each file and not as if we are running the command on a folder and the command needs to index the entire folder.
+
+This is a Python script that needs some refactoring. Currently it is missing some functionality, the last developer that refactored the code didn't finished.
+
+The Task
+It is the same task as the last developer had, just that you will need to complete it, you can continue with the same approach, but by the next explanation of what we're looking for to have in this code, i think you will understand that it is better to do it in another way. After you will learn the current code structure, you will be able to understand how it is set to work now and how it is best to achieve what is described.
+
+When the script runs, it needs to create its own index/database of files, where they are located and their "last modified" date.
+On first run it will create the index for all of the files, and will try to run the s3cmd command for each of the files.
+On second run, it will need to run the command while looking at both the index and the current state, then do the following.
+If there is a file that exist and not modified for the parameter given (For example 7 days), it will skip it.
+Then goes to the next file, if it was deleted and exist in the index, but no longer in the folder, it needs to run another sync command (for example, instead of "sync" value, it will use the "del" value as a parameter).
+Then goes to the next file, if it was changed in yesterday, then it is less than 7 days, it needs to run the command using the default "sync" value.
+Each statement that the script will pass, needs to update the index, so next time, it will know if to skip etc..
+
+Communication
+Attached is the script in its final version, read it, learn it, then if all is clear, start with the task ASAP.
+I expect you to update when you are planning to start the task, and around which times do you think you will have questions or some updates, so i can make sure to be as available as possible to respond immediately if/when needed.
+Feel free to ask me whatever you need regarding this, and if something is not clear, don't hesitate.
+
+Good Luck 🙂
+
+=====================================================================================
+
+
+
+Pavlo Gorun: I have some additional questions:
+1. is there any trace log (call stack) with errors after executing script on large folders ?
+2. which errors it produce when running on large files ?
+3. for which amount of files do this script run correctly? 
+4. how should I test this script? I need some more info or some credentials
+
+
+
+=====================================================================================
+Hey
+
+a. It is constantly changing, this is why on each run, the script will need to index the changes and compare while running, if files was changed (And when) or removed. This is not a parameter we will want to follow or to construct the code based on it. one day it can be 100k files more, another day it will be 10 files more and the following day it can be 3 files more and 20k files less.
+b. Doesn't matter, i will be able to set the "date modified" parameter, so the script will run the command if it will see that a file was last modified up below the time that was set in the relevant parameter.
+I will also run the script using CRON, so no need to schedule it, it will just need to follow the logic of the parameters set to it.
+For example, if i will want to set it once a week, i can set in CRON that it will run once a week and the "date modified" parameter to 7 days..
+
+1. Currently not. We are trying to keep development on it to the minimum. See note number 1 below on the following subject.
+2. For now, treat small files and large the same.
+3. Currently this script does not run since we have not use with it until it will work stable and will do what we need from it. if you mean the s3cmd command.. from around more than 10 - 50k of files it is starting to be unusable/unstable for us.
+4. better that you will replace the s3cmd command with some appending to log, and run on some internal test folder of yours with just a few files. If the logic will work correctly adter QA (knows when to skip, run sync or del commands), send it to me and i will scale it for a larger test on our environment.
+
+Note:
+1. A simple log file will be very helpful. Having the next functionality.
+on each run, Append the next operations and their time started and finished (If finished is too much work, just leave start time), "script started", "index started", in case the compare will not be during the entire run, but will create an updated index and will compare between indexes to construct a list of operations and then updating the main index for the next run of the compare, then include a "second index build started", then "compare started", "total of files changed", "total of files deleted", "total of files skipped", "script finished". As you can see, it is mainly the entire logic, just not per each file, any general main operations that can give us an idea of what the script reviewed, what it did, and if there are some specific errors you can throw in case you can recognize them, make sure to include them as well (Shouldn't be per each file, if there is an error for a specific file for some reason, better append the type of the error, then if there is more than x errors, break the code).
+2. Add the functionality that the script operation will run in the background or will be printed.
+For either each of the operations the script will do and separately and the information that will be printed to a logfile. We will need the ability to print to console what is being appended to logfile on each run).
+3. You can see in the current functionality that we have the option to limit how many files will be synced. This functionality must remain and the script need to add it to the index. if the file was "processed", so unless nothing changed on the file (not modified nor deleted), if running the script with 100 files limit, it will sync the first 100 files.
+Here is an example,
+If we have 300 files in total, and we are runnig the script with 100 limit (for first time so most definitely there will not be index and no file will be skipped) -> The script will see there is nothing to compare, so while building the first index, it will fall into the "sync" statement, in that case 100 files will get synced, 200 files will be indexed but will be counted that they need to get synced next time, then if running again using limit of 150 files -> 150 more files will get synced and only 50 will be left, if the script will run again using limit of 70 -> Last 50 files will be synced and if no other files was modified by then, the script will finish and each next run will process just the modified/deleted files.
+This limit functionality is very important, every general reset of the backup routine for any reason, will require us to run the script with limiting the amount of files. as sometimes 1M files can cause a problem with just once consistent run. Also due to resources etc..
