@@ -46,11 +46,12 @@ Batch processing:
 """
 
 import argparse
-import commands
+#import commands
 import datetime
 import functools
 import os
 import sys
+import sqlite3
 import time
 
 MARKER_FILE = ".syncstat.lock"
@@ -64,6 +65,13 @@ THROUGHPUT_TABLE = {
     "hour": datetime.timedelta(hours=1).total_seconds(),
     "day": datetime.timedelta(days=1).total_seconds(),
 }
+DB_PATH_SQLITE = 'files.sqlite'
+FILE_STATUS_ADDED = 'ADDED'
+FILE_STATUS_MODIFIED = 'MODIFIED'
+FILE_STATUS_NOT_MODIFIED = 'NOT MODIFIED'
+FILE_STATUS_REMOVED = 'REMOVED'
+SYNC_STATUS_FAILED = 'FAILED'
+SYNC_STATUS_OK = 'OK'
 
 
 def main(
@@ -135,6 +143,178 @@ def prepare_markers(marker, old_marker, **kw):
         os.rename(marker, old_marker)
     if not os.path.exists(old_marker):
         open(old_marker, "a").close()
+
+
+def init_db(**kw):
+    try:
+        conn = sqlite3.connect(DB_PATH_SQLITE)
+        conn.row_factory = sqlite3.Row  # allows us to work with Rows instead of tuples
+        cur = conn.cursor()
+
+        cur.execute('''CREATE TABLE IF NOT EXISTS files (
+                    id INTEGER PRIMARY KEY,
+                    file TEXT, 
+                    modified_at REAL, 
+                    checked INTEGER, 
+                    file_status TEXT,
+                    synced INTEGER, 
+                    synced_at REAL, 
+                    sync_status TEXT
+                    )''')
+
+    except sqlite3.Error as e:
+        print(e)
+    except:
+        print "Unexpected error:", sys.exc_info()[0]
+        #raise
+    else:
+        conn.close()
+
+
+def index_files(directory, stats, **kw):
+
+    # Amount of collected files before writing to DB
+    BATCH_SIZE = 1000
+
+    def check_file(cur, file_name, files_info):
+        """ Check file's modification time """
+        # "Total: {count_total}. "
+        # "Modified: {count_modified}. "
+        # "Uploaded: {count_uploaded}. "
+        # "Deleted: {count_deleted}. "
+        # "Errors: {count_errors}.".format(**stats)
+
+        try:
+            stat = os.stat(file_name)
+
+            cur.execute("SELECT * FROM files WHERE file = ?", (file_name,))
+            f_record = cur.fetchone()  # cur.fetchmany(size=BATCH_SIZE)
+
+            # existed record
+            if f_record:
+                #
+                f_status = FILE_STATUS_NOT_MODIFIED
+                if f_record['modified_at'] < stat.st_mtime:
+                    stats["count_modified"] += 1
+                    f_status = FILE_STATUS_MODIFIED
+                else:
+                    # we shouldn't process just 'added' files as 'not changed'
+                    if f_record['file_status'] == FILE_STATUS_ADDED:
+                        f_status = FILE_STATUS_ADDED
+                    # if file was modified before syncing, then we should leave that status until sync
+                    elif f_record['file_status'] == FILE_STATUS_MODIFIED:
+                        f_status = FILE_STATUS_MODIFIED
+
+                files_info.append({
+                    "id": f_record['id'],
+                    "file": file_name,
+                    "modified_at": stat.st_mtime,
+                    "checked": True,
+                    "file_status": f_status,
+                    "synced": f_record['synced']
+                })
+            # new record
+            else:
+                files_info.append({
+                    # "id": None,
+                    "file": file_name,
+                    "modified_at": stat.st_mtime,
+                    "checked": True,
+                    "file_status": FILE_STATUS_ADDED,
+                    "synced": False
+                })
+
+            return True
+        except OSError as e:
+            sys.stderr.write("{}\n".format(e))
+            stats["count_errors"] += 1
+            return False
+
+
+    def update_db(cur, files_info):
+        # qry_strings = []
+        new_files = []
+        modified_files = []
+        not_modified_files = []
+        not_modified_added_files = []
+        for info in files_info:
+            if not info.get('id'):
+                new_files.append( (info.get('file'), info.get('modified_at'), FILE_STATUS_ADDED ))
+                # qry_strings.append("INSERT INTO files(file, modified_at, checked, file_status) VALUES (info.get('file'), info.get('modified_at'), 1, FILE_STATUS_ADDED)")
+            else:
+                if info.get('file_status') == FILE_STATUS_MODIFIED:
+                    modified_files.append( (info.get('modified_at'), FILE_STATUS_MODIFIED, info.get('id')) )
+                    # qry_strings.append("UPDATE files SET modified_at=info.get('modified_at'), checked=1, file_status=FILE_STATUS_MODIFIED WHERE id = info.get('id')")
+                elif info.get('file_status') == FILE_STATUS_NOT_MODIFIED:
+                    not_modified_files.append( info.get('id') )
+                    # qry_strings.append("UPDATE files SET file_status=FILE_STATUS_NOT_MODIFIED WHERE id in (info.get('id'))")
+                elif info.get('file_status') == FILE_STATUS_ADDED:
+                    not_modified_added_files.append( info.get('id') )
+
+        # add new files
+        if new_files:
+            cur.executemany("INSERT INTO files(file, modified_at, checked, file_status) VALUES (?, ?, 1, ?)", new_files)
+
+        # update modified
+        if modified_files:
+            cur.executemany("UPDATE files SET modified_at=?, checked = 1, file_status=? WHERE id = ?", modified_files)
+
+        # update not modified
+        if not_modified_files:
+            qry = "UPDATE files SET checked = 1, file_status=? WHERE id IN ({})".format(', '.join(str(x) for x in not_modified_files))
+            cur.execute(qry, (FILE_STATUS_NOT_MODIFIED, ))
+        if not_modified_added_files:
+            qry = "UPDATE files SET checked = 1, file_status=? WHERE id IN ({})".format(', '.join(str(x) for x in not_modified_added_files))
+            cur.execute(qry, (FILE_STATUS_ADDED,) )
+
+        # cur.executescript("""""".join(qry)) # to surround final qry by """
+
+
+    try:
+        # 0. establish DB connection
+        conn = sqlite3.connect(DB_PATH_SQLITE)
+        conn.row_factory = sqlite3.Row  # allows us to work with Rows instead of tuples
+        cur = conn.cursor()
+
+        # 1. refresh current index
+        cur.execute("UPDATE files SET checked = 0")
+
+        # 2. scan for added/modified/not modified files
+        # for optimization purposes we process batches
+        files_processed = 0
+        files_info = []     #array of dict (id=123, file='file_path', modified_at=12345, file_status='some_status')
+        for root, dirs, files in os.walk(directory):
+            for name in files:
+                filename = os.path.join(root, name)
+                stats["count_total"] += 1
+
+                if check_file(cur, filename, files_info):
+                    files_processed += 1
+
+                if files_processed >= BATCH_SIZE:
+                    update_db(cur, files_info)
+                    files_info = []
+                    files_processed = 0
+                    print("files processed: {}".format(stats["count_total"]))
+        if files_processed > 0:
+            update_db(cur, files_info)
+            files_info = []
+            files_processed = 0
+            print("files processed: {}".format(stats["count_total"]))
+
+        # 3. mark rest files as "REMOVED"
+        cur.execute("UPDATE files SET checked = 1, file_status = ? WHERE checked = 0", (FILE_STATUS_REMOVED, ))
+
+        # Save (commit) the changes
+        conn.commit()
+
+    except sqlite3.Error as e:
+        print(e)
+    except:
+        print "Unexpected error:", sys.exc_info()[0]
+        #raise
+    else:
+        conn.close()
 
 
 def process_removed(
@@ -285,10 +465,19 @@ def jitter(max_files, per_time, files_processed, started_time):
 
 
 def s3cmd(args, *suffix):
+    """
+    Executes s3cmd commands.
+    https://s3tools.org/usage
+    Examples:
+        s3cmd put FILE [FILE...] s3://BUCKET[/PREFIX]
+        s3cmd del s3://BUCKET/OBJECT
+        s3cmd get s3://BUCKET/OBJECT LOCAL_FILE
+    """
     return " ".join(["s3cmd"] + [repr(i) for i in args] + list(suffix))
 
 
 def s3path(s3buket, directory, filename):
+    """ Build s3 path by removing directory prefix from file path. I.e. using only file's name"""
     return "s3://" + os.path.join(s3buket, del_prefix(filename, directory))
 
 
@@ -305,6 +494,15 @@ def del_prefix(path, prefix):
 if __name__ == "__main__":
     kw = parse(cli())
     prepare_markers(**kw)
-    main(**kw)
-    process_removed(**kw)
+    init_db(**kw)
+
+    # start timer
+    start_time = time.time()
+
+    index_files(**kw)
+    # main(**kw)
+    # process_removed(**kw)
     report(**kw)
+
+    # print execution time
+    print("Executed in %s seconds" % (time.time() - start_time))

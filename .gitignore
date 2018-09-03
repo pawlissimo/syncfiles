@@ -29,3 +29,4 @@ ENV/
 .idea
 tmp/
 test/
+*.sqlite
