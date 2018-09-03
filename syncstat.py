@@ -74,9 +74,7 @@ def main(
     jit_counter = 0
 
     with open(marker, "w") as f:
-
         for root, dirs, files in os.walk(directory):
-
             for name in files:
                 filename = os.path.join(root, name)
                 stats["count_total"] += 1
@@ -103,7 +101,7 @@ def main(
 
                 debug(cmd)
 
-                status, output = commands.getstatusoutput(cmd)
+                status, output = get_status_output(cmd)
                 if status:
                     sys.stderr.write("{}\n".format(output))
                     stats["count_errors"] += 1
@@ -114,7 +112,25 @@ def main(
                 jit_counter, jit_time = jitter(jit_counter, jit_time)
 
 
-def prepare_diff(marker, old_marker, **kw):
+def get_status_output(*args, **kwargs):
+    try:
+        # Python 2.6+
+        import commands
+
+        return commands.getstatusoutput(*args)
+    except ImportError:
+        # Python 3+
+        import subprocess
+
+        return subprocess.getstatusoutput(*args)
+
+    ### https://stackoverflow.com/questions/11344557/replacement-for-getstatusoutput-in-python-3
+    # p = subprocess.Popen(*args, **kwargs)
+    # stdout, stderr = p.communicate()
+    # return p.returncode, stdout, stderr
+
+
+def prepare_markers(marker, old_marker, **kw):
     if os.path.exists(marker):
         os.rename(marker, old_marker)
     if not os.path.exists(old_marker):
@@ -126,7 +142,7 @@ def process_removed(
 ):
     sort_cmd = " ".join(["sort", "-o", marker, marker])
     debug(sort_cmd)
-    status, _ = commands.getstatusoutput(sort_cmd)
+    status, _ = get_status_output(sort_cmd)
     assert not status, "sort marker file failed"
 
     diff_cmd = " ".join(
@@ -139,7 +155,7 @@ def process_removed(
         ]
     )
     debug(diff_cmd)
-    status, output = commands.getstatusoutput(diff_cmd)
+    status, output = get_status_output(diff_cmd)
     removed_files = output.strip().split()
     jit_time = time.time()
     jit_counter = 0
@@ -148,7 +164,7 @@ def process_removed(
         stats["count_total"] += 1
         cmd = cmd_del_template.format(s3(removed_file))
         debug(cmd)
-        status, output = commands.getstatusoutput(cmd)
+        status, output = get_status_output(cmd)
         if status:
             sys.stderr.write("{}\n".format(output))
             stats["count_errors"] += 1
@@ -180,23 +196,14 @@ def cli():
     )
 
     parser.add_argument(
-        "-d",
-        "--debug",
-        default=False,
-        action="store_true",
-        help="print debug information",
+        "-d", "--debug", default=False, action="store_true", help="print debug information",
     )
 
     parser.add_argument(
-        "-i",
-        "--ignore-mtime",
-        default=False,
-        action="store_true",
-        help="process files regardless of modification time",
+        "-i", "--ignore-mtime", default=False, action="store_true", help="process files regardless of modification time",
     )
 
     # Throughput.
-
     parser.add_argument(
         "-t", "--throughput", type=int, help="number of files processed at time"
     )
@@ -206,26 +213,17 @@ def cli():
     )
 
     # Batches.
-
     parser.add_argument(
         "-l", "--limit", type=int, help="maximum number of files to process"
     )
 
     parser.add_argument(
-        "-m",
-        "--marker-dir",
-        default=CWD,
-        type=str,
-        help="directory to store marker files",
+        "-m", "--marker-dir", default=CWD, type=str, help="directory to store marker files",
     )
 
     # S3cmd arguments.
-
     parser.add_argument(
-        "attrs",
-        nargs="*",
-        type=str,
-        help="custom attributes passed to the s3cmd directry",
+        "attrs", nargs="*", type=str, help="custom attributes passed to the s3cmd directry",
     )
 
     return parser.parse_args()
@@ -306,7 +304,7 @@ def del_prefix(path, prefix):
 
 if __name__ == "__main__":
     kw = parse(cli())
-    prepare_diff(**kw)
+    prepare_markers(**kw)
     main(**kw)
     process_removed(**kw)
     report(**kw)

@@ -1,0 +1,4 @@
+# python==2.7
+commands
+argparse
+s3cmd

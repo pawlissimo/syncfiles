@@ -27,3 +27,5 @@ ENV/
 
 # Other
 .idea
+tmp/
+test/
