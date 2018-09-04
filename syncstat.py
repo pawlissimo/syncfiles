@@ -176,7 +176,7 @@ def index_files(directory, stats, **kw):
     # Amount of collected files before writing to DB
     BATCH_SIZE = 1000
 
-    def check_file(cur, file_name, files_info):
+    def check_files(cur, file_names, files_info):
         """ Check file's modification time """
         # "Total: {count_total}. "
         # "Modified: {count_modified}. "
@@ -185,49 +185,62 @@ def index_files(directory, stats, **kw):
         # "Errors: {count_errors}.".format(**stats)
 
         try:
-            stat = os.stat(file_name)
+            qry = """SELECT * FROM files WHERE file in ('{}')""".format("', '".join(file_names))
+            cur.execute(qry)
+            existed_records = cur.fetchall()  # cur.fetchmany(size=BATCH_SIZE)
 
-            cur.execute("SELECT * FROM files WHERE file = ?", (file_name,))
-            f_record = cur.fetchone()  # cur.fetchmany(size=BATCH_SIZE)
+            for file_name in file_names:
+                existed_record = None
+                for rec in existed_records:
+                    if file_name == rec['file']:
+                        existed_record = rec
+                        break
 
-            # existed record
-            if f_record:
-                #
-                f_status = FILE_STATUS_NOT_MODIFIED
-                if f_record['modified_at'] < stat.st_mtime:
-                    stats["count_modified"] += 1
-                    f_status = FILE_STATUS_MODIFIED
-                else:
-                    # we shouldn't process just 'added' files as 'not changed'
-                    if f_record['file_status'] == FILE_STATUS_ADDED:
-                        f_status = FILE_STATUS_ADDED
-                    # if file was modified before syncing, then we should leave that status until sync
-                    elif f_record['file_status'] == FILE_STATUS_MODIFIED:
+                try:
+                    stat = os.stat(file_name)
+                except OSError as e:
+                    sys.stderr.write("{}\n".format(e))
+                    stats["count_errors"] += 1
+                    continue
+
+                if existed_record:
+                    f_status = FILE_STATUS_NOT_MODIFIED
+                    if existed_record['modified_at'] < stat.st_mtime:
+                        stats["count_modified"] += 1
                         f_status = FILE_STATUS_MODIFIED
+                    else:
+                        # we shouldn't process just 'added' files as 'not changed'
+                        if existed_record['file_status'] == FILE_STATUS_ADDED:
+                            f_status = FILE_STATUS_ADDED
+                        # if file was modified before syncing, then we should leave that status until sync
+                        elif existed_record['file_status'] == FILE_STATUS_MODIFIED:
+                            f_status = FILE_STATUS_MODIFIED
 
-                files_info.append({
-                    "id": f_record['id'],
-                    "file": file_name,
-                    "modified_at": stat.st_mtime,
-                    "checked": True,
-                    "file_status": f_status,
-                    "synced": f_record['synced']
-                })
-            # new record
-            else:
-                files_info.append({
-                    # "id": None,
-                    "file": file_name,
-                    "modified_at": stat.st_mtime,
-                    "checked": True,
-                    "file_status": FILE_STATUS_ADDED,
-                    "synced": False
-                })
+                    files_info.append({
+                        "id": existed_record['id'],
+                        "file": file_name,
+                        "modified_at": stat.st_mtime,
+                        "checked": True,
+                        "file_status": f_status,
+                        "synced": existed_record['synced']
+                    })
+
+                    # remove existed_record from existed_records for optimization purposes
+                    existed_records.remove(existed_record)
+                # new record
+                else:
+                    files_info.append({
+                        # "id": None,
+                        "file": file_name,
+                        "modified_at": stat.st_mtime,
+                        "checked": True,
+                        "file_status": FILE_STATUS_ADDED,
+                        "synced": False
+                    })
 
             return True
-        except OSError as e:
-            sys.stderr.write("{}\n".format(e))
-            stats["count_errors"] += 1
+        except sqlite3.Error as e:
+            print(e)
             return False
 
 
@@ -282,24 +295,28 @@ def index_files(directory, stats, **kw):
         # 2. scan for added/modified/not modified files
         # for optimization purposes we process batches
         files_processed = 0
-        files_info = []     #array of dict (id=123, file='file_path', modified_at=12345, file_status='some_status')
+        files_info = []     # array of dict (id=123, file='file_path', modified_at=12345, file_status='some_status')
+        files_to_check = [] # array of filenames
         for root, dirs, files in os.walk(directory):
             for name in files:
                 filename = os.path.join(root, name)
+                files_to_check.append(filename)
+                files_processed += 1
                 stats["count_total"] += 1
 
-                if check_file(cur, filename, files_info):
-                    files_processed += 1
-
                 if files_processed >= BATCH_SIZE:
+                    check_files(cur, files_to_check, files_info)
                     update_db(cur, files_info)
-                    files_info = []
                     files_processed = 0
+                    files_info = []
+                    files_to_check = []
                     print("files processed: {}".format(stats["count_total"]))
         if files_processed > 0:
+            check_files(cur, files_to_check, files_info)
             update_db(cur, files_info)
-            files_info = []
             files_processed = 0
+            files_info = []
+            files_to_check = []
             print("files processed: {}".format(stats["count_total"]))
 
         # 3. mark rest files as "REMOVED"
