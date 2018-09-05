@@ -49,6 +49,7 @@ import argparse
 #import commands
 import datetime
 import functools
+from multiprocessing.dummy import Pool as ThreadPool
 import os
 import sys
 import sqlite3
@@ -176,67 +177,82 @@ def index_files(directory, stats, **kw):
     # Amount of collected files before writing to DB
     BATCH_SIZE = 1000
 
-    def check_files(cur, file_names, files_info):
+    def check_files(connection, file_names, files_info):
         """ Check file's modification time """
         # "Total: {count_total}. "
+        # "Added: {count_added}. "
         # "Modified: {count_modified}. "
         # "Uploaded: {count_uploaded}. "
         # "Deleted: {count_deleted}. "
         # "Errors: {count_errors}.".format(**stats)
 
+        def thread_checking(file_name, existed_records):
+            file_info = {}
+            existed_record = None
+            for rec in existed_records:
+                if file_name == rec['file']:
+                    existed_record = rec
+                    break
+
+            try:
+                stat = os.stat(file_name)
+            except OSError as e:
+                sys.stderr.write("{}\n".format(e))
+                stats["count_errors"] += 1
+                return {} # continue
+
+            if existed_record:
+                f_status = FILE_STATUS_NOT_MODIFIED
+                if existed_record['modified_at'] < stat.st_mtime:
+                    stats["count_modified"] += 1
+                    f_status = FILE_STATUS_MODIFIED
+                else:
+                    # we shouldn't process just 'added' files as 'not changed'
+                    if existed_record['file_status'] == FILE_STATUS_ADDED:
+                        stats["count_added"] += 1
+                        f_status = FILE_STATUS_ADDED
+                    # if file was modified before syncing, then we should leave that status until sync
+                    elif existed_record['file_status'] == FILE_STATUS_MODIFIED:
+                        stats["count_modified"] += 1
+                        f_status = FILE_STATUS_MODIFIED
+
+                file_info = {
+                    "id": existed_record['id'],
+                    "file": file_name,
+                    "modified_at": stat.st_mtime,
+                    "checked": True,
+                    "file_status": f_status,
+                    "synced": existed_record['synced']
+                }
+
+                # remove existed_record from existed_records for optimization purposes
+                # unfortunately I can't so easy remove it when running in multithreading
+                # existed_records.remove(existed_record)
+            # new record
+            else:
+                stats["count_added"] += 1
+                file_info = {
+                    # "id": None,
+                    "file": file_name,
+                    "modified_at": stat.st_mtime,
+                    "checked": True,
+                    "file_status": FILE_STATUS_ADDED,
+                    "synced": False
+                }
+
+            return file_info
+
         try:
+            cur = connection.cursor()
             qry = """SELECT * FROM files WHERE file in ('{}')""".format("', '".join(file_names))
             cur.execute(qry)
             existed_records = cur.fetchall()  # cur.fetchmany(size=BATCH_SIZE)
 
-            for file_name in file_names:
-                existed_record = None
-                for rec in existed_records:
-                    if file_name == rec['file']:
-                        existed_record = rec
-                        break
-
-                try:
-                    stat = os.stat(file_name)
-                except OSError as e:
-                    sys.stderr.write("{}\n".format(e))
-                    stats["count_errors"] += 1
-                    continue
-
-                if existed_record:
-                    f_status = FILE_STATUS_NOT_MODIFIED
-                    if existed_record['modified_at'] < stat.st_mtime:
-                        stats["count_modified"] += 1
-                        f_status = FILE_STATUS_MODIFIED
-                    else:
-                        # we shouldn't process just 'added' files as 'not changed'
-                        if existed_record['file_status'] == FILE_STATUS_ADDED:
-                            f_status = FILE_STATUS_ADDED
-                        # if file was modified before syncing, then we should leave that status until sync
-                        elif existed_record['file_status'] == FILE_STATUS_MODIFIED:
-                            f_status = FILE_STATUS_MODIFIED
-
-                    files_info.append({
-                        "id": existed_record['id'],
-                        "file": file_name,
-                        "modified_at": stat.st_mtime,
-                        "checked": True,
-                        "file_status": f_status,
-                        "synced": existed_record['synced']
-                    })
-
-                    # remove existed_record from existed_records for optimization purposes
-                    existed_records.remove(existed_record)
-                # new record
-                else:
-                    files_info.append({
-                        # "id": None,
-                        "file": file_name,
-                        "modified_at": stat.st_mtime,
-                        "checked": True,
-                        "file_status": FILE_STATUS_ADDED,
-                        "synced": False
-                    })
+            pool = ThreadPool(8)
+            res = pool.map(functools.partial(thread_checking, existed_records=existed_records), file_names)
+            files_info.extend( res )
+            pool.close()
+            # pool.join()
 
             return True
         except sqlite3.Error as e:
@@ -244,25 +260,26 @@ def index_files(directory, stats, **kw):
             return False
 
 
-    def update_db(cur, files_info):
-        # qry_strings = []
+    def update_db(connection, files_info):
+        cur = connection.cursor()
         new_files = []
         modified_files = []
         not_modified_files = []
         not_modified_added_files = []
         for info in files_info:
-            if not info.get('id'):
-                new_files.append( (info.get('file'), info.get('modified_at'), FILE_STATUS_ADDED ))
-                # qry_strings.append("INSERT INTO files(file, modified_at, checked, file_status) VALUES (info.get('file'), info.get('modified_at'), 1, FILE_STATUS_ADDED)")
-            else:
-                if info.get('file_status') == FILE_STATUS_MODIFIED:
-                    modified_files.append( (info.get('modified_at'), FILE_STATUS_MODIFIED, info.get('id')) )
-                    # qry_strings.append("UPDATE files SET modified_at=info.get('modified_at'), checked=1, file_status=FILE_STATUS_MODIFIED WHERE id = info.get('id')")
-                elif info.get('file_status') == FILE_STATUS_NOT_MODIFIED:
-                    not_modified_files.append( info.get('id') )
-                    # qry_strings.append("UPDATE files SET file_status=FILE_STATUS_NOT_MODIFIED WHERE id in (info.get('id'))")
-                elif info.get('file_status') == FILE_STATUS_ADDED:
-                    not_modified_added_files.append( info.get('id') )
+            if info.get('modified_at'):
+                if not info.get('id'):
+                    new_files.append( (info.get('file'), info.get('modified_at'), FILE_STATUS_ADDED ))
+                    # qry_strings.append("INSERT INTO files(file, modified_at, checked, file_status) VALUES (info.get('file'), info.get('modified_at'), 1, FILE_STATUS_ADDED)")
+                else:
+                    if info.get('file_status') == FILE_STATUS_MODIFIED:
+                        modified_files.append( (info.get('modified_at'), FILE_STATUS_MODIFIED, info.get('id')) )
+                        # qry_strings.append("UPDATE files SET modified_at=info.get('modified_at'), checked=1, file_status=FILE_STATUS_MODIFIED WHERE id = info.get('id')")
+                    elif info.get('file_status') == FILE_STATUS_NOT_MODIFIED:
+                        not_modified_files.append( info.get('id') )
+                        # qry_strings.append("UPDATE files SET file_status=FILE_STATUS_NOT_MODIFIED WHERE id in (info.get('id'))")
+                    elif info.get('file_status') == FILE_STATUS_ADDED:
+                        not_modified_added_files.append( info.get('id') )
 
         # add new files
         if new_files:
@@ -280,8 +297,6 @@ def index_files(directory, stats, **kw):
             qry = "UPDATE files SET checked = 1, file_status=? WHERE id IN ({})".format(', '.join(str(x) for x in not_modified_added_files))
             cur.execute(qry, (FILE_STATUS_ADDED,) )
 
-        # cur.executescript("""""".join(qry)) # to surround final qry by """
-
 
     try:
         # 0. establish DB connection
@@ -292,7 +307,17 @@ def index_files(directory, stats, **kw):
         # 1. refresh current index
         cur.execute("UPDATE files SET checked = 0")
 
-        # 2. scan for added/modified/not modified files
+        # 2a. get files count in directory
+        status, output = get_status_output("find {} -type f -printf . | wc -c".format(directory))
+        if output.isdigit():
+            try:
+                total_files = int(output)
+            except ValueError:
+                total_files = 0
+        else:
+            total_files = 0
+
+        # 2b. scan for added/modified/not modified files
         # for optimization purposes we process batches
         files_processed = 0
         files_info = []     # array of dict (id=123, file='file_path', modified_at=12345, file_status='some_status')
@@ -305,19 +330,21 @@ def index_files(directory, stats, **kw):
                 stats["count_total"] += 1
 
                 if files_processed >= BATCH_SIZE:
-                    check_files(cur, files_to_check, files_info)
-                    update_db(cur, files_info)
+                    check_files(conn, files_to_check, files_info)
+                    update_db(conn, files_info)
                     files_processed = 0
                     files_info = []
                     files_to_check = []
-                    print("files processed: {}".format(stats["count_total"]))
+                    sys.stdout.write( "\rfiles/processed: {} / {}".format(total_files, stats["count_total"]) )
+                    sys.stdout.flush()
         if files_processed > 0:
-            check_files(cur, files_to_check, files_info)
-            update_db(cur, files_info)
+            check_files(conn, files_to_check, files_info)
+            update_db(conn, files_info)
             files_processed = 0
             files_info = []
             files_to_check = []
-            print("files processed: {}".format(stats["count_total"]))
+            sys.stdout.write("\rfiles/processed: {} / {}".format(total_files, stats["count_total"]))
+            sys.stdout.flush()
 
         # 3. mark rest files as "REMOVED"
         cur.execute("UPDATE files SET checked = 1, file_status = ? WHERE checked = 0", (FILE_STATUS_REMOVED, ))
@@ -373,7 +400,9 @@ def process_removed(
 
 def report(stats, **kw):
     print(
+        "\n"
         "Total: {count_total}. "
+        "Added: {count_added}. "
         "Modified: {count_modified}. "
         "Uploaded: {count_uploaded}. "
         "Deleted: {count_deleted}. "
@@ -452,6 +481,7 @@ def parse(args):
         "old_marker": os.path.join(args.marker_dir, OLD_MARKER_FILE),
         "stats": {
             "count_total": 0,
+            "count_added": 0,
             "count_modified": 0,
             "count_uploaded": 0,
             "count_deleted": 0,
@@ -522,4 +552,4 @@ if __name__ == "__main__":
     report(**kw)
 
     # print execution time
-    print("Executed in %s seconds" % (time.time() - start_time))
+    print "Executed in %s seconds" % (time.time() - start_time)
