@@ -208,16 +208,16 @@ def index_files(directory, stats, **kw):
             if existed_record:
                 f_status = FILE_STATUS_NOT_MODIFIED
                 if existed_record['modified_at'] < stat.st_mtime:
-                    update_stats("count_modified", 1)
+                    # update_stats("count_modified", 1)
                     f_status = FILE_STATUS_MODIFIED
                 else:
                     # we shouldn't process just 'added' files as 'not changed'
                     if existed_record['file_status'] == FILE_STATUS_ADDED:
-                        update_stats("count_added", 1)
+                        # update_stats("count_added", 1)
                         f_status = FILE_STATUS_ADDED
                     # if file was modified before syncing, then we should leave that status until sync
                     elif existed_record['file_status'] == FILE_STATUS_MODIFIED:
-                        update_stats("count_modified", 1)
+                        # update_stats("count_modified", 1)
                         f_status = FILE_STATUS_MODIFIED
 
                 file_info = {
@@ -235,7 +235,7 @@ def index_files(directory, stats, **kw):
                 lock.release()
             # new record
             else:
-                update_stats("count_added", 1)
+                # update_stats("count_added", 1)
                 file_info = {
                     # "id": None,
                     "file": file_name,
@@ -355,6 +355,13 @@ def index_files(directory, stats, **kw):
         # 3. mark rest files as "REMOVED"
         cur.execute("UPDATE files SET checked = 1, file_status = ? WHERE checked = 0", (FILE_STATUS_REMOVED, ))
 
+        # 4. collect statistic
+        cur.execute("SELECT file_status, COUNT(*) as cnt FROM files GROUP BY file_status;")
+        statistic = cur.fetchall()
+        print "\nResults:"
+        for s in statistic:
+            print "{}: {}".format(s['file_status'], s['cnt'])
+
         # Save (commit) the changes
         conn.commit()
 
@@ -408,10 +415,10 @@ def report(stats, **kw):
     print(
         "\n"
         "Total: {count_total}. "
-        "Added: {count_added}. "
-        "Modified: {count_modified}. "
-        "Uploaded: {count_uploaded}. "
-        "Deleted: {count_deleted}. "
+        # "Added: {count_added}. "
+        # "Modified: {count_modified}. "
+        # "Uploaded: {count_uploaded}. "
+        # "Deleted: {count_deleted}. "
         "Errors: {count_errors}.".format(**stats)
     )
 
