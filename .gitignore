@@ -30,3 +30,4 @@ ENV/
 tmp/
 test/
 *.sqlite
+*.sqlite-journal

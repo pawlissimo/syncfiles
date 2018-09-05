@@ -50,6 +50,7 @@ import argparse
 import datetime
 import functools
 from multiprocessing.dummy import Pool as ThreadPool
+from multiprocessing import Lock as ThreadLock
 import os
 import sys
 import sqlite3
@@ -175,16 +176,19 @@ def init_db(**kw):
 def index_files(directory, stats, **kw):
 
     # Amount of collected files before writing to DB
-    BATCH_SIZE = 1000
+    BATCH_SIZE = 3000
+    lock = ThreadLock()
+
+    def update_stats(param, value):
+        lock.acquire()
+        try:
+            stats[param] += value
+        finally:
+            lock.release()
+
 
     def check_files(connection, file_names, files_info):
         """ Check file's modification time """
-        # "Total: {count_total}. "
-        # "Added: {count_added}. "
-        # "Modified: {count_modified}. "
-        # "Uploaded: {count_uploaded}. "
-        # "Deleted: {count_deleted}. "
-        # "Errors: {count_errors}.".format(**stats)
 
         def thread_checking(file_name, existed_records):
             file_info = {}
@@ -198,22 +202,22 @@ def index_files(directory, stats, **kw):
                 stat = os.stat(file_name)
             except OSError as e:
                 sys.stderr.write("{}\n".format(e))
-                stats["count_errors"] += 1
+                update_stats("count_errors", 1)
                 return {} # continue
 
             if existed_record:
                 f_status = FILE_STATUS_NOT_MODIFIED
                 if existed_record['modified_at'] < stat.st_mtime:
-                    stats["count_modified"] += 1
+                    update_stats("count_modified", 1)
                     f_status = FILE_STATUS_MODIFIED
                 else:
                     # we shouldn't process just 'added' files as 'not changed'
                     if existed_record['file_status'] == FILE_STATUS_ADDED:
-                        stats["count_added"] += 1
+                        update_stats("count_added", 1)
                         f_status = FILE_STATUS_ADDED
                     # if file was modified before syncing, then we should leave that status until sync
                     elif existed_record['file_status'] == FILE_STATUS_MODIFIED:
-                        stats["count_modified"] += 1
+                        update_stats("count_modified", 1)
                         f_status = FILE_STATUS_MODIFIED
 
                 file_info = {
@@ -226,11 +230,12 @@ def index_files(directory, stats, **kw):
                 }
 
                 # remove existed_record from existed_records for optimization purposes
-                # unfortunately I can't so easy remove it when running in multithreading
-                # existed_records.remove(existed_record)
+                lock.acquire()
+                existed_records.remove(existed_record)
+                lock.release()
             # new record
             else:
-                stats["count_added"] += 1
+                update_stats("count_added", 1)
                 file_info = {
                     # "id": None,
                     "file": file_name,
@@ -248,11 +253,12 @@ def index_files(directory, stats, **kw):
             cur.execute(qry)
             existed_records = cur.fetchall()  # cur.fetchmany(size=BATCH_SIZE)
 
-            pool = ThreadPool(8)
+            pool = ThreadPool(4)
             res = pool.map(functools.partial(thread_checking, existed_records=existed_records), file_names)
-            files_info.extend( res )
             pool.close()
             # pool.join()
+
+            files_info.extend(res)
 
             return True
         except sqlite3.Error as e:
@@ -327,7 +333,7 @@ def index_files(directory, stats, **kw):
                 filename = os.path.join(root, name)
                 files_to_check.append(filename)
                 files_processed += 1
-                stats["count_total"] += 1
+                update_stats("count_total", 1)
 
                 if files_processed >= BATCH_SIZE:
                     check_files(conn, files_to_check, files_info)
